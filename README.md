@@ -1,36 +1,93 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ⚡ Prowider Lead Distribution System
 
-## Getting Started
+A robust, highly concurrent, and real-time Lead Distribution System built using **Next.js 14 App Router (Node.js)**, **Supabase PostgreSQL**, **Prisma ORM**, and **Tailwind-free Vanilla HSL CSS**.
 
-First, run the development server:
+---
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## 🚀 Setup Instructions
+
+### 1. Prerequisites
+- **Node.js**: `v18.x` or `v20.x`+
+- **Database**: A Supabase PostgreSQL instance (or any standard PostgreSQL database).
+
+### 2. Local Environment Setup
+Clone the repository, create a `.env` file in the root directory, and add your Supabase connection strings (making sure to URL-encode passwords containing special characters):
+
+```env
+# Connection pooled URL (used for application runtime queries)
+DATABASE_URL="postgresql://<username>:<encoded-password>@<host>:6543/postgres?pgbouncer=true&connection_limit=1"
+
+# Direct URL (used by Prisma for migrations/generation)
+DIRECT_URL="postgresql://<username>:<encoded-password>@<host>:5432/postgres"
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### 3. Installation & Database Setup
+```bash
+# Install dependencies
+npm install
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+# Generate the Prisma Client
+npx prisma generate
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+# Push database schema & Seed starting services/providers
+npx prisma db push
+npx prisma db seed
+```
 
-## Learn More
+### 4. Running the App
+```bash
+# Run local development server
+npm run dev
 
-To learn more about Next.js, take a look at the following resources:
+# Or build & run in Production Mode (Recommended)
+npm run build
+npm start
+```
+Visit the local server at `http://localhost:3000`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+---
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## 🧠 Technical Architecture
 
-## Deploy on Vercel
+### 1. Allocation Algorithm (State-Persistent Round Robin)
+The application assigns leads to providers based on a fair, state-persistent **Round Robin** sequence tailored to the requested service.
+- **Service Specific Rotation**: The current rotation index is stored in the database (`ServiceRotation` model) mapped to each `service_id` (1: Plumbing, 2: Electrical, 3: Landscaping).
+- **Quota Validation**:
+  - Providers start with a daily quota (e.g., `10` leads).
+  - The algorithm fetches all active providers offering the requested service whose `quota_left` is strictly greater than `0`.
+  - Providers are sorted by their database ID to maintain a deterministic ring sequence.
+- **Sequence Assignment**:
+  - The algorithm retrieves the `next_index` from the `ServiceRotation` table.
+  - It finds the next eligible provider in the sorted ring starting at `next_index` (wrapping around with modular arithmetic `index % providers.length`).
+  - It decreases the allocated provider's `quota_left` by 1.
+  - It updates `next_index` in `ServiceRotation` to the next position in the sequence, ensuring state persistence across serverless executions.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+---
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### 2. Concurrency Handling (Race-Condition Prevention)
+In a high-traffic environment, multiple customers might request the same service simultaneously. Simple queries would cause race conditions (e.g., two requests reading the same `next_index` simultaneously, assigning the lead to the same provider, and skipping the next in line).
+
+To prevent this:
+- **Database Row-Level Locking (`SELECT FOR UPDATE`)**: 
+  We run the allocation process within an isolated **Prisma Transaction** (`$transaction`).
+  ```sql
+  SELECT * FROM "ServiceRotation" WHERE "service_id" = $1 FOR UPDATE;
+  ```
+  - `FOR UPDATE` places an exclusive lock on that service's rotation row. 
+  - If 10 requests hit the server simultaneously, PostgreSQL serializes them. The 2nd request is blocked until the 1st request finishes updating the index and completes its transaction.
+- **Connection Isolation**:
+  To protect against pool exhaustion during heavy locking, we configure `connection_limit=1` on our `DATABASE_URL` (pooler), allowing efficient queueing.
+
+---
+
+### 3. Webhook Idempotency (Exactly-Once Execution)
+Our quota-reset webhook at `/api/webhook/quota-reset` is designed to be triggered by external cron services or event hooks. If the network retries a request, or if multiple nodes trigger it concurrently, we must prevent double-processing (which would double quotas or cause database conflicts).
+
+- **Unique Event Constraints**:
+  We maintain a `WebhookEvent` table in our database with a `UNIQUE` constraint on the `idempotency_key` column.
+- **Atomic Operations**:
+  When a request arrives with an `X-Idempotency-Key` header:
+  1. It attempts to write a new record to `WebhookEvent` containing the key.
+  2. If the write succeeds, the request proceeds, resets the provider quotas, and updates the event status to `PROCESSED`.
+  3. If the write fails (throwing a Prisma `P2002` duplicate key error), it means another server thread is already processing or has completed this webhook.
+  4. The duplicate request is immediately halted and returns a graceful `200 OK` with `{ already_processed: true }`, completely avoiding double-execution.
