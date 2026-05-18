@@ -1,0 +1,77 @@
+// Prowider Mini Lead Distribution System - Prisma Schema
+
+generator client {
+  provider = "prisma-client-js"
+  engineType = "library"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Service {
+  id          Int              @id
+  name        String
+  leads       Lead[]
+  rotation    ServiceRotation?
+
+  @@map("services")
+}
+
+model Provider {
+  id             Int              @id
+  name           String
+  monthly_quota  Int              @default(10)
+  leads_received Int              @default(0)
+  assignments    LeadAssignment[]
+
+  @@map("providers")
+}
+
+model Lead {
+  id            String           @id @default(uuid())
+  customer_name String
+  phone         String
+  city          String
+  service_id    Int
+  description   String
+  created_at    DateTime         @default(now())
+  service       Service          @relation(fields: [service_id], references: [id])
+  assignments   LeadAssignment[]
+
+  // Enforce no duplicate lead for same phone + service at DB level
+  @@unique([phone, service_id])
+  @@map("leads")
+}
+
+model LeadAssignment {
+  id          String   @id @default(uuid())
+  lead_id     String
+  provider_id Int
+  assigned_at DateTime @default(now())
+  lead        Lead     @relation(fields: [lead_id], references: [id], onDelete: Cascade)
+  provider    Provider @relation(fields: [provider_id], references: [id])
+
+  // Prevent same provider receiving same lead twice
+  @@unique([lead_id, provider_id])
+  @@map("lead_assignments")
+}
+
+model ServiceRotation {
+  service_id    Int     @id
+  provider_pool Int[]
+  next_index    Int     @default(0)
+  service       Service @relation(fields: [service_id], references: [id])
+
+  @@map("service_rotations")
+}
+
+model WebhookEvent {
+  idempotency_key String   @id
+  processed_at    DateTime @default(now())
+  action          String
+
+  @@map("webhook_events")
+}
